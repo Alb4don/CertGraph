@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ app_name }} — SSL Certificate Intelligence</title>
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+:root {
+  --bg: #0b0f19;
+  --surface: #121826;
+  --surface2: #1a2234;
+  --border: #2a3548;
+  --text: #e8eef7;
+  --muted: #8b9bb4;
+  --accent: #3b82f6;
+  --accent2: #06b6d4;
+  --critical: #ef4444;
+  --high: #f97316;
+  --medium: #eab308;
+  --low: #22c55e;
+  --success: #10b981;
+  --radius: 12px;
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+.header {
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 1.25rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.logo {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.logo span { font-weight: 400; opacity: 0.7; font-size: 0.85rem; margin-left: 0.5rem; -webkit-text-fill-color: var(--muted); }
+.badge {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.main {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  height: calc(100vh - 72px);
+}
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 1.5rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+.panel {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+}
+.panel h3 {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.85rem;
+}
+textarea {
+  width: 100%;
+  min-height: 120px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 0.75rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  resize: vertical;
+}
+textarea:focus { outline: none; border-color: var(--accent); }
+.row { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.75rem; }
+input[type="text"], input[type="number"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  width: 100%;
+}
+input:focus { outline: none; border-color: var(--accent); }
+label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+button.primary {
+  width: 100%;
+  margin-top: 1rem;
+  background: linear-gradient(135deg, var(--accent), #2563eb);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+button.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(59, 130, 246, 0.35);
+}
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.progress-wrap {
+  margin-top: 1rem;
+  display: none;
+}
+.progress-bar {
+  height: 6px;
+  background: var(--bg);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  width: 0%;
+  transition: width 0.3s;
+}
+.progress-text {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.4rem;
+  text-align: right;
+}
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+.stat {
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 0.65rem;
+  text-align: center;
+}
+.stat .num { font-size: 1.25rem; font-weight: 700; }
+.stat .lbl { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; }
+.stat.critical .num { color: var(--critical); }
+.stat.high .num { color: var(--high); }
+.stat.medium .num { color: var(--medium); }
+.stat.low .num { color: var(--low); }
+.content {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tabs {
+  display: flex;
+  gap: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 1rem;
+}
+.tab {
+  padding: 0.9rem 1.25rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s;
+}
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.tab:hover { color: var(--text); }
+.view {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  display: none;
+}
+.view.active { display: block; }
+#graph {
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(ellipse at center, #111827 0%, #0b0f19 70%);
+}
+.results-panel {
+  height: 100%;
+  overflow-y: auto;
+  padding: 1rem 1.5rem;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin-bottom: 0.75rem;
+  transition: border-color 0.15s;
+}
+.card:hover { border-color: var(--accent); }
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+.card-title {
+  font-weight: 600;
+  font-size: 1rem;
+}
+.card-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+.tags { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; }
+.tag {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  background: var(--surface2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+.tag.critical { background: rgba(239,68,68,0.15); color: var(--critical); border-color: rgba(239,68,68,0.3); }
+.tag.high { background: rgba(249,115,22,0.15); color: var(--high); border-color: rgba(249,115,22,0.3); }
+.tag.medium { background: rgba(234,179,8,0.15); color: var(--medium); border-color: rgba(234,179,8,0.3); }
+.tag.low { background: rgba(34,197,94,0.15); color: var(--low); border-color: rgba(34,197,94,0.3); }
+.tag.ok { background: rgba(16,185,129,0.15); color: var(--success); border-color: rgba(16,185,129,0.3); }
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+}
+.detail-item .k { color: var(--muted); }
+.detail-item .v { color: var(--text); font-family: ui-monospace, monospace; word-break: break-all; }
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  gap: 0.75rem;
+}
+.empty svg { opacity: 0.3; }
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block; margin-right: 6px;
+}
+.status-dot.live { background: var(--success); box-shadow: 0 0 8px var(--success); animation: pulse 1.5s infinite; }
+.status-dot.off { background: var(--muted); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+@media (max-width: 900px) {
+  .main { grid-template-columns: 1fr; }
+  .sidebar { max-height: 40vh; }
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">CertGraph <span>v{{ version }}</span></div>
+  <div style="display:flex;align-items:center;gap:1rem">
+    <span class="badge"><span class="status-dot off" id="wsDot"></span><span id="wsStatus">Connecting…</span></span>
+    <span class="badge" id="scanBadge">No active scan</span>
+  </div>
+</div>
+<div class="main">
+  <aside class="sidebar">
+    <div class="panel">
+      <h3>Targets</h3>
+      <textarea id="targets" placeholder="example.com&#10;api.example.com&#10;192.0.2.1"></textarea>
+      <div class="row">
+        <input type="text" id="ports" value="443" placeholder="Ports (comma-separated)">
+      </div>
+      <div class="row" style="margin-top:0.75rem">
+        <label class="checkbox"><input type="checkbox" id="analyze" checked> Vulnerability analysis</label>
+      </div>
+      <button class="primary" id="scanBtn" onclick="startScan()">Start Scan</button>
+      <div class="progress-wrap" id="progressWrap">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-text" id="progressText">0%</div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Vulnerability Summary</h3>
+      <div class="stats">
+        <div class="stat critical"><div class="num" id="sCrit">0</div><div class="lbl">Critical</div></div>
+        <div class="stat high"><div class="num" id="sHigh">0</div><div class="lbl">High</div></div>
+        <div class="stat medium"><div class="num" id="sMed">0</div><div class="lbl">Medium</div></div>
+        <div class="stat low"><div class="num" id="sLow">0</div><div class="lbl">Low</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Recent Scans</h3>
+      <div id="scanList" style="font-size:0.8rem;color:var(--muted)">Loading…</div>
+    </div>
+  </aside>
+  <div class="content">
+    <div class="tabs">
+      <div class="tab active" data-tab="graph">Graph View</div>
+      <div class="tab" data-tab="results">Certificate Results</div>
+    </div>
+    <div class="view active" id="view-graph">
+      <div id="graph"></div>
+      <div class="empty" id="graphEmpty">
+        <svg width="64" height="64" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="32" cy="32" r="24"/><path d="M32 16v16l10 6"/></svg>
+        <div>Start a scan to visualize certificate relationships</div>
+      </div>
+    </div>
+    <div class="view" id="view-results">
+      <div class="results-panel" id="resultsPanel">
+        <div class="empty">Results will appear here in real time</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const API_TOKEN = {{ api_token | tojson }};
+function authHeaders(extra) {
+  const headers = Object.assign({}, extra || {});
+  if (API_TOKEN) headers['X-API-Token'] = API_TOKEN;
+  return headers;
+}
+const nodes = new vis.DataSet([]);
+const edges = new vis.DataSet([]);
+let network = null;
+let currentScanId = null;
+let ws = null;
+const resultsMap = new Map();
+
+function initGraph() {
+  const container = document.getElementById('graph');
+  const data = { nodes, edges };
+  const options = {
+    nodes: {
+      shape: 'dot',
+      size: 18,
+      font: { color: '#e8eef7', size: 13, face: 'Inter' },
+      borderWidth: 2,
+      shadow: true
+    },
+    edges: {
+      color: { color: '#3b82f680', highlight: '#3b82f6' },
+      width: 1.5,
+      smooth: { type: 'continuous' },
+      arrows: { to: { enabled: true, scaleFactor: 0.6 } }
+    },
+    groups: {
+      host: { color: { background: '#3b82f6', border: '#60a5fa' }, shape: 'diamond', size: 22 },
+      certificate: { color: { background: '#06b6d4', border: '#22d3ee' }, shape: 'dot', size: 20 },
+      issuer: { color: { background: '#8b5cf6', border: '#a78bfa' }, shape: 'hexagon', size: 24 },
+      intermediate_ca: { color: { background: '#8b5cf6', border: '#a78bfa' }, shape: 'hexagon', size: 22 },
+      root_ca: { color: { background: '#d946ef', border: '#f0abfc' }, shape: 'star', size: 26 },
+      san: { color: { background: '#64748b', border: '#94a3b8' }, shape: 'dot', size: 12 },
+      vulnerability: { color: { background: '#ef4444', border: '#f87171' }, shape: 'triangle', size: 16 }
+    },
+    physics: {
+      enabled: true,
+      barnesHut: { gravitationalConstant: -2800, springLength: 140, springConstant: 0.04 },
+      stabilization: { iterations: 80 }
+    },
+    interaction: { hover: true, tooltipDelay: 120 }
+  };
+  network = new vis.Network(container, data, options);
+}
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const tokenQs = API_TOKEN ? `?token=${encodeURIComponent(API_TOKEN)}` : '';
+  ws = new WebSocket(`${proto}://${location.host}/ws${tokenQs}`);
+  ws.onopen = () => {
+    document.getElementById('wsDot').className = 'status-dot live';
+    document.getElementById('wsStatus').textContent = 'Live';
+  };
+  ws.onclose = () => {
+    document.getElementById('wsDot').className = 'status-dot off';
+    document.getElementById('wsStatus').textContent = 'Reconnecting…';
+    setTimeout(connectWS, 2500);
+  };
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      handleMessage(msg);
+    } catch (e) {}
+  };
+}
+
+function handleMessage(msg) {
+  if (msg.type === 'progress') {
+    const pct = msg.percent || 0;
+    document.getElementById('progressWrap').style.display = 'block';
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressText').textContent = `${msg.completed}/${msg.total} (${pct}%)`;
+    document.getElementById('scanBadge').textContent = `Scan #${msg.scan_id} running`;
+    if (msg.result) {
+      appendResult(msg.result);
+      if (msg.result.success) updateGraphIncremental(msg.result);
+    }
+  } else if (msg.type === 'complete') {
+    document.getElementById('scanBtn').disabled = false;
+    document.getElementById('scanBadge').textContent = `Scan #${msg.scan_id} completed`;
+    if (msg.summary) {
+      document.getElementById('sCrit').textContent = msg.summary.critical || 0;
+      document.getElementById('sHigh').textContent = msg.summary.high || 0;
+      document.getElementById('sMed').textContent = msg.summary.medium || 0;
+      document.getElementById('sLow').textContent = msg.summary.low || 0;
+    }
+    if (msg.graph) renderFullGraph(msg.graph);
+    loadScans();
+  }
+}
+
+function updateGraphIncremental(r) {
+  document.getElementById('graphEmpty').style.display = 'none';
+  const hostId = `host:${r.host}`;
+  const certId = `cert:${(r.fingerprint_sha256 || '').slice(0, 16)}`;
+  if (!nodes.get(hostId)) nodes.add({ id: hostId, label: r.host, group: 'host', title: `Host: ${r.host}:${r.port}` });
+  if (!nodes.get(certId)) nodes.add({
+    id: certId,
+    label: r.subject_cn || certId.slice(5),
+    group: 'certificate',
+    title: `SHA256: ${r.fingerprint_sha256}\nExpires: ${r.not_after}`
+  });
+  const e1 = `${hostId}-${certId}`;
+  if (!edges.get(e1)) edges.add({ id: e1, from: hostId, to: certId, arrows: 'to' });
+
+  let prevId = certId;
+  const chainSummary = r.chain_summary || [];
+  if (chainSummary.length) {
+    chainSummary.forEach((member, idx) => {
+      const label = member.subject_cn || (member.fingerprint || '').slice(0, 12) || 'Unknown CA';
+      const group = member.is_self_signed ? 'root_ca' : 'intermediate_ca';
+      const memberId = `ca:${(member.fingerprint || String(idx)).slice(0, 16)}`;
+      if (!nodes.get(memberId)) nodes.add({ id: memberId, label, group, title: `${label}\n${member.key_type || ''} ${member.key_size || ''}` });
+      const eid = `${prevId}-${memberId}`;
+      if (!edges.get(eid)) edges.add({ id: eid, from: prevId, to: memberId, arrows: 'to' });
+      prevId = memberId;
+    });
+  } else {
+    const issuer = r.issuer_cn || 'Unknown';
+    const issuerId = `issuer:${hashStr(issuer).slice(0, 12)}`;
+    if (!nodes.get(issuerId)) nodes.add({ id: issuerId, label: issuer, group: 'issuer', title: issuer });
+    const e2 = `${certId}-${issuerId}`;
+    if (!edges.get(e2)) edges.add({ id: e2, from: certId, to: issuerId, arrows: 'to' });
+  }
+
+  (r.vulnerabilities || []).filter(v => v.severity === 'critical' || v.severity === 'high').forEach(v => {
+    const vid = `vuln:${(r.fingerprint_sha256 || '').slice(0, 8)}:${v.category}:${(v.title || '').slice(0, 24)}`;
+    if (!nodes.get(vid)) nodes.add({ id: vid, label: v.title, group: 'vulnerability', title: v.description });
+    const e3 = `${certId}-${vid}`;
+    if (!edges.get(e3)) edges.add({ id: e3, from: certId, to: vid, arrows: 'to', color: { color: '#ef444480' } });
+  });
+}
+
+function renderFullGraph(g) {
+  document.getElementById('graphEmpty').style.display = 'none';
+  nodes.clear();
+  edges.clear();
+  (g.nodes || []).forEach(n => {
+    nodes.add({
+      id: n.id,
+      label: n.label,
+      group: n.type || 'certificate',
+      title: JSON.stringify(n.properties || {}, null, 2)
+    });
+  });
+  (g.edges || []).forEach((e, i) => {
+    edges.add({ id: `e${i}`, from: e.source, to: e.target, arrows: 'to' });
+  });
+}
+
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h) + s.charCodeAt(i) | 0;
+  return Math.abs(h).toString(16).padStart(12, '0');
+}
+
+function appendResult(r) {
+  const key = `${r.host}:${r.port}`;
+  resultsMap.set(key, r);
+  const panel = document.getElementById('resultsPanel');
+  if (panel.querySelector('.empty')) panel.innerHTML = '';
+  let card = document.getElementById(`card-${key.replace(/[^a-z0-9]/gi, '_')}`);
+  if (!card) {
+    card = document.createElement('div');
+    card.className = 'card';
+    card.id = `card-${key.replace(/[^a-z0-9]/gi, '_')}`;
+    panel.prepend(card);
+  }
+  if (!r.success) {
+    card.innerHTML = `
+      <div class="card-header">
+        <div class="card-title">${r.host}:${r.port}</div>
+        <span class="tag critical">Failed</span>
+      </div>
+      <div class="card-meta">${r.error || 'Unknown error'}</div>`;
+    return;
+  }
+  const vulns = r.vulnerabilities || [];
+  const tags = vulns.map(v => `<span class="tag ${v.severity}">${v.title}</span>`).join('') || '<span class="tag ok">No issues detected</span>';
+  card.innerHTML = `
+    <div class="card-header">
+      <div>
+        <div class="card-title">${r.subject_cn || r.host}</div>
+        <div class="card-meta">${r.host}:${r.port} · ${r.fingerprint_sha256?.slice(0, 24)}…</div>
+      </div>
+      <div class="tags">${tags}</div>
+    </div>
+    <div class="detail-grid">
+      <div class="detail-item"><div class="k">Issuer</div><div class="v">${r.issuer_cn || '—'}</div></div>
+      <div class="detail-item"><div class="k">Valid From</div><div class="v">${(r.not_before || '').slice(0, 10)}</div></div>
+      <div class="detail-item"><div class="k">Valid Until</div><div class="v">${(r.not_after || '').slice(0, 10)}</div></div>
+      <div class="detail-item"><div class="k">Key</div><div class="v">${(r.key_type || '').toUpperCase()} ${r.key_size || ''} bit</div></div>
+      <div class="detail-item"><div class="k">Signature</div><div class="v">${r.signature_algorithm || '—'}</div></div>
+      <div class="detail-item"><div class="k">SANs</div><div class="v">${(r.sans || []).slice(0, 4).join(', ') || '—'}${(r.sans || []).length > 4 ? '…' : ''}</div></div>
+      <div class="detail-item"><div class="k">Self-Signed</div><div class="v">${r.is_self_signed ? 'Yes' : 'No'}</div></div>
+      <div class="detail-item"><div class="k">Chain Length</div><div class="v">${r.chain_length || 1}</div></div>
+    </div>`;
+}
+
+async function startScan() {
+  const raw = document.getElementById('targets').value;
+  const targets = raw.split(/[\n,;\s]+/).map(t => t.trim()).filter(Boolean);
+  if (!targets.length) { alert('Enter at least one target'); return; }
+  const ports = document.getElementById('ports').value.split(',').map(p => parseInt(p.trim(), 10)).filter(p => p > 0 && p < 65536);
+  if (!ports.length) ports.push(443);
+  const analyze = document.getElementById('analyze').checked;
+  document.getElementById('scanBtn').disabled = true;
+  document.getElementById('progressWrap').style.display = 'block';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressText').textContent = 'Starting…';
+  document.getElementById('resultsPanel').innerHTML = '<div class="empty">Scanning…</div>';
+  resultsMap.clear();
+  nodes.clear();
+  edges.clear();
+  document.getElementById('sCrit').textContent = '0';
+  document.getElementById('sHigh').textContent = '0';
+  document.getElementById('sMed').textContent = '0';
+  document.getElementById('sLow').textContent = '0';
+  try {
+    const res = await fetch('/api/scan', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ targets, ports, deep_chain: true, analyze_vulns: analyze })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Scan failed');
+    }
+    const data = await res.json();
+    currentScanId = data.scan_id;
+    document.getElementById('scanBadge').textContent = `Scan #${data.scan_id} started`;
+  } catch (e) {
+    alert(e.message || 'Failed to start scan');
+    document.getElementById('scanBtn').disabled = false;
+  }
+}
+
+async function loadScans() {
+  try {
+    const res = await fetch('/api/scans', { headers: authHeaders() });
+    const scans = await res.json();
+    const el = document.getElementById('scanList');
+    if (!scans.length) { el.textContent = 'No scans yet'; return; }
+    el.innerHTML = scans.slice(0, 8).map(s =>
+      `<div style="padding:0.35rem 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="loadScan(${s.id})">
+        #${s.id} · ${s.target_count} targets · ${s.status}
+        <div style="font-size:0.7rem;opacity:0.7">${(s.started_at || '').slice(0, 19)}</div>
+      </div>`
+    ).join('');
+  } catch (e) {
+    document.getElementById('scanList').textContent = 'Unable to load';
+  }
+}
+
+async function loadScan(id) {
+  try {
+    const res = await fetch(`/api/scan/${id}`, { headers: authHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById('resultsPanel').innerHTML = '';
+    resultsMap.clear();
+    (data.certificates || []).forEach(c => {
+      const r = {
+        host: c.host, port: c.port, success: true,
+        subject_cn: c.subject_cn, issuer_cn: c.issuer_cn,
+        fingerprint_sha256: c.fingerprint_sha256,
+        not_before: c.not_before, not_after: c.not_after,
+        key_type: c.key_type, key_size: c.key_size,
+        signature_algorithm: c.signature_algorithm,
+        sans: c.sans, is_self_signed: !!c.is_self_signed,
+        chain_length: c.chain_length,
+        vulnerabilities: c.vulnerabilities || []
+      };
+      appendResult(r);
+    });
+    if (data.graph) renderFullGraph(data.graph);
+    let crit = 0, high = 0, med = 0, low = 0;
+    (data.certificates || []).forEach(c => {
+      (c.vulnerabilities || []).forEach(v => {
+        if (v.severity === 'critical') crit++;
+        else if (v.severity === 'high') high++;
+        else if (v.severity === 'medium') med++;
+        else low++;
+      });
+    });
+    document.getElementById('sCrit').textContent = crit;
+    document.getElementById('sHigh').textContent = high;
+    document.getElementById('sMed').textContent = med;
+    document.getElementById('sLow').textContent = low;
+    document.getElementById('scanBadge').textContent = `Scan #${id} loaded`;
+  } catch (e) {}
+}
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('view-' + tab.dataset.tab).classList.add('active');
+    if (tab.dataset.tab === 'graph' && network) network.fit();
+  });
+});
+
+initGraph();
+connectWS();
+loadScans();
+</script>
+</body>
+</html>
