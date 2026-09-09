@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from cryptography import x509
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID, NameOID
@@ -33,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_NAME = "CertGraph"
 APP_VERSION = "1.0.0"
@@ -44,12 +43,14 @@ BANNER = r"""
 / /___/  __/ /  / /_/ /_/ / /  / /_/ / /_/ / /_
 \____/\___/_/   \__/\____/_/   \__,_/ .___/\__/
                                    /_/
-        Certificate Intelligence 
-                    v{version} | 
+        Certificate Intelligence
+                    v{version} |
 """.format(version=APP_VERSION)
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="CERTGRAPH_")
+
     host: str = "127.0.0.1"
     port: int = 8443
     db_path: str = "data/certgraph.db"
@@ -61,9 +62,51 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_token: Optional[str] = None
     scan_requests_per_minute: int = 20
+    allow_private_targets: bool = True
+    max_concurrent_scans: int = 2
 
-    class Config:
-        env_prefix = "CERTGRAPH_"
+    @field_validator("port")
+    @classmethod
+    def _validate_port(cls, v: int) -> int:
+        if not 1 <= v <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+        return v
+
+    @field_validator(
+        "max_workers",
+        "max_targets",
+        "max_scan_work",
+        "scan_requests_per_minute",
+        "max_concurrent_scans",
+    )
+    @classmethod
+    def _validate_positive_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("value must be a positive integer")
+        return v
+
+    @field_validator("connect_timeout", "rate_limit_per_host")
+    @classmethod
+    def _validate_positive_float(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("value must be greater than zero")
+        return v
+
+    @field_validator("db_path")
+    @classmethod
+    def _validate_db_path(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("db_path must not be empty")
+        return v
+
+    @field_validator("log_level")
+    @classmethod
+    def _validate_log_level(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("log_level must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
+        return v
 
 
 settings = Settings()
@@ -112,13 +155,45 @@ def _is_ip(host: str) -> bool:
         return False
 
 
+def _is_restricted_ip(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
 def _is_private_scope(host: str) -> bool:
     if _is_ip(host):
         try:
-            return ipaddress.ip_address(host).is_private
+            return _is_restricted_ip(ipaddress.ip_address(host))
         except ValueError:
             return False
     return any(p.match(host) for p in PRIVATE_HOST_PATTERNS)
+
+
+def _first_allowed_ip(host: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return None, "DNS resolution failed"
+    chosen: Optional[str] = None
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _is_restricted_ip(ip):
+            return None, "Target resolves to a restricted address"
+        if chosen is None:
+            chosen = addr
+    if not chosen:
+        return None, "DNS resolution failed"
+    return chosen, None
 
 
 def _extract_host_from_authority(t: str) -> Optional[str]:
@@ -144,6 +219,8 @@ class TargetInput(BaseModel):
         cleaned: List[str] = []
         seen: Set[str] = set()
         for raw in v:
+            if len(raw) > 300:
+                continue
             t = raw.strip().lower()
             if not t or any(ord(ch) < 0x20 for ch in t):
                 continue
@@ -268,6 +345,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_cert_host ON certificates(host);
                 CREATE INDEX IF NOT EXISTS idx_cert_spki ON certificates(spki_fingerprint);
                 CREATE INDEX IF NOT EXISTS idx_vuln_cert ON vulnerabilities(cert_id);
+                CREATE INDEX IF NOT EXISTS idx_nodes_scan ON graph_nodes(scan_id);
+                CREATE INDEX IF NOT EXISTS idx_edges_scan ON graph_edges(scan_id);
             """)
 
     def create_scan(self, target_count: int) -> int:
@@ -276,7 +355,7 @@ class Database:
                 "INSERT INTO scans (started_at, target_count, status) VALUES (?, ?, ?)",
                 (datetime.now(timezone.utc).isoformat(), target_count, "running"),
             )
-            return cur.lastrowid
+            return int(cur.lastrowid or 0)
 
     def finish_scan(self, scan_id: int) -> None:
         with self._lock, self._conn:
@@ -285,11 +364,24 @@ class Database:
                 (datetime.now(timezone.utc).isoformat(), "completed", scan_id),
             )
 
+    def fail_scan(self, scan_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE scans SET finished_at = ?, status = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), "failed", scan_id),
+            )
+
     def store_certificate(self, scan_id: int, data: Dict[str, Any]) -> int:
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM certificates WHERE scan_id=? AND host=? AND port=? AND fingerprint_sha256=?",
+                (scan_id, data["host"], data["port"], data["fingerprint_sha256"]),
+            ).fetchone()
+            if row:
+                return int(row["id"])
             cur = self._conn.execute(
                 """
-                INSERT OR IGNORE INTO certificates (
+                INSERT INTO certificates (
                     scan_id, host, port, fingerprint_sha256, subject_cn, issuer_cn,
                     serial_number, not_before, not_after, signature_algorithm,
                     key_type, key_size, is_self_signed, is_ca, sans, chain_length,
@@ -318,13 +410,7 @@ class Database:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
-            if cur.lastrowid:
-                return cur.lastrowid
-            row = self._conn.execute(
-                "SELECT id FROM certificates WHERE scan_id=? AND host=? AND port=? AND fingerprint_sha256=?",
-                (scan_id, data["host"], data["port"], data["fingerprint_sha256"]),
-            ).fetchone()
-            return row["id"] if row else 0
+            return int(cur.lastrowid or 0)
 
     def store_vulnerabilities(self, cert_id: int, vulns: List[Dict[str, Any]]) -> None:
         if not vulns or not cert_id:
@@ -411,6 +497,7 @@ class Database:
             }
 
     def list_scans(self, limit: int = 50) -> List[Dict]:
+        limit = max(1, min(int(limit), 500))
         with self._lock, self._conn:
             rows = self._conn.execute(
                 "SELECT id, started_at, finished_at, target_count, status FROM scans ORDER BY id DESC LIMIT ?",
@@ -441,10 +528,10 @@ class ConnectionManager:
         payload = json.dumps(message, default=str)
         async with self._lock:
             targets = list(self.active)
-        dead = []
+        dead: List[WebSocket] = []
         for ws in targets:
             try:
-                await ws.send_text(payload)
+                await asyncio.wait_for(ws.send_text(payload), timeout=10)
             except Exception:
                 dead.append(ws)
         if dead:
@@ -458,6 +545,8 @@ manager = ConnectionManager()
 
 
 class ScanRateLimiter:
+    MAX_TRACKED_CLIENTS = 4096
+
     def __init__(self, per_minute: int):
         self.per_minute = max(1, per_minute)
         self._lock = threading.Lock()
@@ -467,6 +556,12 @@ class ScanRateLimiter:
         now = time.monotonic()
         window_start = now - 60.0
         with self._lock:
+            if len(self._hits) > self.MAX_TRACKED_CLIENTS:
+                stale = [k for k, v in self._hits.items() if not v or v[-1] <= window_start]
+                for k in stale:
+                    del self._hits[k]
+                if len(self._hits) > self.MAX_TRACKED_CLIENTS:
+                    self._hits.clear()
             hits = [h for h in self._hits.get(key, []) if h > window_start]
             if len(hits) >= self.per_minute:
                 self._hits[key] = hits
@@ -776,7 +871,26 @@ def _analyze_vulnerabilities(chain: List[x509.Certificate], host: str) -> List[D
     return vulns
 
 
-def _fetch_certificate(host: str, port: int, timeout: float) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[x509.Certificate]]:
+def _fetch_certificate(
+    host: str,
+    port: int,
+    timeout: float,
+    allow_private: bool = True,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[x509.Certificate]]:
+    connect_host = host
+    if not allow_private:
+        if _is_ip(host):
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                return None, "Invalid target address", []
+            if _is_restricted_ip(ip):
+                return None, "Target address is not allowed", []
+        else:
+            resolved, scope_error = _first_allowed_ip(host)
+            if scope_error or not resolved:
+                return None, scope_error or "Target address is not allowed", []
+            connect_host = resolved
     try:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
@@ -785,8 +899,9 @@ def _fetch_certificate(host: str, port: int, timeout: float) -> Tuple[Optional[D
             context.set_ciphers("DEFAULT:@SECLEVEL=0")
         except ssl.SSLError:
             pass
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            with context.wrap_socket(sock, server_hostname=host if not _is_ip(host) else None) as ssock:
+        with socket.create_connection((connect_host, port), timeout=timeout) as sock:
+            sni = host if not _is_ip(host) else None
+            with context.wrap_socket(sock, server_hostname=sni) as ssock:
                 der_list: List[bytes] = []
                 get_chain = getattr(ssock, "get_unverified_chain", None)
                 if callable(get_chain):
@@ -811,7 +926,7 @@ def _fetch_certificate(host: str, port: int, timeout: float) -> Tuple[Optional[D
                 certs: List[x509.Certificate] = []
                 for der in der_list:
                     try:
-                        certs.append(x509.load_der_x509_certificate(der, default_backend()))
+                        certs.append(x509.load_der_x509_certificate(der))
                     except Exception:
                         continue
                 if not certs:
@@ -937,6 +1052,17 @@ def build_graph(results: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     return list(nodes.values()), edges
 
 
+def _slim_result(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        k: v for k, v in entry.items()
+        if k not in ("raw_pem", "chain_fps", "chain_summary", "sans")
+    }
+
+
+_scan_slots = asyncio.Semaphore(settings.max_concurrent_scans)
+_background_tasks: Set[asyncio.Task] = set()
+
+
 async def run_scan(targets: List[str], ports: List[int], deep: bool, analyze: bool, scan_id: int) -> None:
     total = len(targets) * len(ports)
     completed = 0
@@ -945,6 +1071,7 @@ async def run_scan(targets: List[str], ports: List[int], deep: bool, analyze: bo
     executor = ThreadPoolExecutor(max_workers=min(settings.max_workers, max(total, 1)))
     loop = asyncio.get_running_loop()
     last_host_time: Dict[str, float] = {}
+    host_locks: Dict[str, asyncio.Lock] = {}
     completed_lock = asyncio.Lock()
 
     async def process_one(host: str, port: int) -> None:
@@ -957,20 +1084,24 @@ async def run_scan(targets: List[str], ports: List[int], deep: bool, analyze: bo
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            now = time.monotonic()
-            last = last_host_time.get(host, 0.0)
-            delay = settings.rate_limit_per_host - (now - last)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            last_host_time[host] = time.monotonic()
+            lock = host_locks.setdefault(host, asyncio.Lock())
+            async with lock:
+                now = time.monotonic()
+                last = last_host_time.get(host, 0.0)
+                delay = settings.rate_limit_per_host - (now - last)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                last_host_time[host] = time.monotonic()
 
             data, err, chain_certs = await loop.run_in_executor(
-                executor, _fetch_certificate, host, port, settings.connect_timeout
+                executor, _fetch_certificate, host, port, settings.connect_timeout, settings.allow_private_targets
             )
             entry["success"] = data is not None
             entry["error"] = err
             if data:
                 entry.update(data)
+                if chain_certs and not deep:
+                    chain_certs = chain_certs[:1]
                 if analyze and chain_certs:
                     try:
                         entry["vulnerabilities"] = _analyze_vulnerabilities(chain_certs, host)
@@ -979,7 +1110,7 @@ async def run_scan(targets: List[str], ports: List[int], deep: bool, analyze: bo
                         entry["vulnerabilities"] = []
                 else:
                     entry["vulnerabilities"] = []
-                if len(chain_certs) > 1:
+                if deep and len(chain_certs) > 1:
                     entry["chain_summary"] = [
                         {
                             "subject_cn": _get_cn(c.subject),
@@ -1002,6 +1133,8 @@ async def run_scan(targets: List[str], ports: List[int], deep: bool, analyze: bo
                             db.store_vulnerabilities(cert_id, entry["vulnerabilities"])
                         except Exception:
                             logger.error("Failed to persist findings for %s:%s", host, port)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Unhandled error scanning %s:%s", host, port)
             entry["success"] = False
@@ -1017,50 +1150,70 @@ async def run_scan(targets: List[str], ports: List[int], deep: bool, analyze: bo
                 "completed": current,
                 "total": total,
                 "percent": round(100.0 * current / total, 1) if total else 100,
-                "result": entry,
+                "result": _slim_result(entry),
             })
 
-    tasks = [process_one(h, p) for h in targets for p in ports]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    executor.shutdown(wait=False)
-
     try:
-        spki_groups = db.certs_by_spki(scan_id)
-        for spki, cert_ids in spki_groups.items():
-            if len(cert_ids) < 2:
-                continue
-            finding = [{
-                "severity": "medium",
-                "category": "trust",
-                "title": "Private Key Reused Across Certificates",
-                "description": f"The same public key material appears in {len(cert_ids)} certificates collected in this scan",
-                "confidence": 0.8,
-            }]
-            for cert_id in cert_ids:
-                db.store_vulnerabilities(cert_id, finding)
-            for entry in results:
-                if cert_id_map.get((entry.get("host"), entry.get("port"))) in cert_ids:
-                    entry.setdefault("vulnerabilities", []).extend(finding)
-    except Exception:
-        logger.error("Cross-host key reuse analysis failed for scan %s", scan_id)
+        tasks = [process_one(h, p) for h in targets for p in ports]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    nodes, edges = build_graph(results)
-    db.store_graph(scan_id, nodes, edges)
-    db.finish_scan(scan_id)
+        try:
+            spki_groups = db.certs_by_spki(scan_id)
+            for spki, cert_ids in spki_groups.items():
+                if len(cert_ids) < 2:
+                    continue
+                finding = [{
+                    "severity": "medium",
+                    "category": "trust",
+                    "title": "Private Key Reused Across Certificates",
+                    "description": f"The same public key material appears in {len(cert_ids)} certificates collected in this scan",
+                    "confidence": 0.8,
+                }]
+                for cert_id in cert_ids:
+                    db.store_vulnerabilities(cert_id, finding)
+                for entry in results:
+                    if cert_id_map.get((entry.get("host"), entry.get("port"))) in cert_ids:
+                        entry.setdefault("vulnerabilities", []).extend(finding)
+        except Exception:
+            logger.exception("Cross-host key reuse analysis failed for scan %s", scan_id)
 
-    await manager.broadcast({
-        "type": "complete",
-        "scan_id": scan_id,
-        "total": total,
-        "success_count": sum(1 for r in results if r.get("success")),
-        "graph": {"nodes": nodes, "edges": edges},
-        "summary": {
-            "critical": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "critical"),
-            "high": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "high"),
-            "medium": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "medium"),
-            "low": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "low"),
-        },
-    })
+        try:
+            nodes, edges = build_graph(results)
+            db.store_graph(scan_id, nodes, edges)
+        except Exception:
+            logger.exception("Graph construction failed for scan %s", scan_id)
+            db.fail_scan(scan_id)
+            await manager.broadcast({
+                "type": "error",
+                "scan_id": scan_id,
+                "detail": "Scan failed while persisting results",
+            })
+            return
+
+        db.finish_scan(scan_id)
+
+        await manager.broadcast({
+            "type": "complete",
+            "scan_id": scan_id,
+            "total": total,
+            "success_count": sum(1 for r in results if r.get("success")),
+            "graph": {"nodes": nodes, "edges": edges},
+            "summary": {
+                "critical": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "critical"),
+                "high": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "high"),
+                "medium": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "medium"),
+                "low": sum(1 for r in results for v in r.get("vulnerabilities") or [] if v.get("severity") == "low"),
+            },
+        })
+    except asyncio.CancelledError:
+        try:
+            db.fail_scan(scan_id)
+        except Exception:
+            pass
+        raise
+    finally:
+        executor.shutdown(wait=False)
+        _scan_slots.release()
 
 
 def verify_token(x_api_token: Optional[str] = Header(None), token: Optional[str] = Query(None)) -> None:
@@ -1095,22 +1248,46 @@ async def lifespan(app: FastAPI):
     logger.info("%s %s starting on %s:%s (%s)", APP_NAME, APP_VERSION, settings.host, settings.port, platform.system())
     if settings.host not in ("127.0.0.1", "localhost", "::1") and not settings.api_token:
         logger.warning("Listening on %s without an API token configured; set CERTGRAPH_API_TOKEN to restrict access", settings.host)
+    if settings.allow_private_targets:
+        logger.info("Private/internal target scanning is enabled; set CERTGRAPH_ALLOW_PRIVATE_TARGETS=false for exposed deployments")
     yield
     db.close()
     logger.info("%s shutdown", APP_NAME)
 
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    nonce = secrets.token_urlsafe(24)
+    request.state.csp_nonce = nonce
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        f"style-src 'self' 'nonce-{nonce}'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "font-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, token: Optional[str] = Query(None)):
-    if settings.api_token and token != settings.api_token:
-        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+async def index(request: Request, _token_ok: None = Depends(verify_token)):
     return templates.TemplateResponse(request, "index.html", {
         "app_name": APP_NAME,
         "version": APP_VERSION,
@@ -1118,13 +1295,36 @@ async def index(request: Request, token: Optional[str] = Query(None)):
     })
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
 @app.post("/api/scan", dependencies=[Depends(verify_token)])
 async def start_scan(payload: TargetInput, request: Request):
     client_key = request.client.host if request.client else "unknown"
     if not scan_rate_limiter.allow(client_key):
         raise HTTPException(status_code=429, detail="Too many scan requests, slow down")
-    scan_id = db.create_scan(len(payload.targets) * len(payload.ports))
-    asyncio.create_task(run_scan(payload.targets, payload.ports, payload.deep_chain, payload.analyze_vulns, scan_id))
+    if not settings.allow_private_targets:
+        blocked = [t for t in payload.targets if _is_private_scope(t)]
+        if blocked:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{len(blocked)} target(s) are in restricted address space and were rejected",
+            )
+    try:
+        await asyncio.wait_for(_scan_slots.acquire(), timeout=0.5)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="Maximum concurrent scans reached; try again shortly")
+    try:
+        scan_id = db.create_scan(len(payload.targets) * len(payload.ports))
+    except Exception:
+        _scan_slots.release()
+        logger.exception("Failed to create scan record")
+        raise HTTPException(status_code=500, detail="Failed to start scan")
+    task = asyncio.create_task(run_scan(payload.targets, payload.ports, payload.deep_chain, payload.analyze_vulns, scan_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return {"scan_id": scan_id, "status": "started", "targets": len(payload.targets), "ports": payload.ports}
 
 
@@ -1150,22 +1350,26 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
+            if len(data) > 64:
+                await websocket.close(code=1009)
+                return
             if data == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
-        await manager.disconnect(websocket)
+        pass
     except Exception:
+        logger.debug("WebSocket handler error", exc_info=True)
+    finally:
         await manager.disconnect(websocket)
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled error on %s: %s", request.url.path, type(exc).__name__)
+    logger.error("Unhandled error on %s: %s", request.url.path, type(exc).__name__, exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 def main():
-    print(BANNER)
     if platform.system() != "Windows" and settings.port < 1024 and not _is_admin():
         logger.error(
             "Binding to port %s requires elevated privileges on this platform. "
@@ -1176,7 +1380,7 @@ def main():
     import uvicorn
     try:
         uvicorn.run(
-            "certgraph:app",
+            app,
             host=settings.host,
             port=settings.port,
             log_level=settings.log_level.lower(),
@@ -1192,6 +1396,7 @@ def main():
         sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Shutdown requested")
+
 
 if __name__ == "__main__":
     main()
